@@ -1,0 +1,81 @@
+x-app: &app
+  build: .
+  image: doc-processing-fastapi
+  environment:
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-docproc}:${POSTGRES_PASSWORD:-docproc}@db:5432/${POSTGRES_DB:-docproc}
+    REDIS_URL: redis://redis:6379/0
+    UPLOAD_DIR: /data/uploads
+    JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
+    JOB_RETRY_BACKOFF_SECONDS: ${JOB_RETRY_BACKOFF_SECONDS:-5}
+    JOB_STALE_AFTER_SECONDS: ${JOB_STALE_AFTER_SECONDS:-300}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  volumes:
+    - uploads:/data/uploads  # API writes files, workers read them
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-docproc}
+      POSTGRES_USER: ${POSTGRES_USER:-docproc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docproc}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]  # persist the queue across restarts
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    <<: *app
+    command: ["python", "-m", "app.db"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
+    stop_grace_period: 30s  # let the current job finish on SIGTERM
+    deploy:
+      replicas: 2  # scale further with: docker compose up --scale worker=10
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
